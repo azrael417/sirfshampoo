@@ -43,7 +43,7 @@ def gather_params(parameters: List[Tensor]) -> List[Tensor]:
     for p in parameters:
         param = p.clone()
         if hasattr(p, "sharded_dims_mp"):
-            for d, group in enumerate(param.sharded_dims_mp):
+            for d, group in enumerate(p.sharded_dims_mp):
                 if (group is not None) and (comm.get_size(group) > 1):
                     param = gather_uneven(param, d, group)
         params.append(param)
@@ -52,11 +52,11 @@ def gather_params(parameters: List[Tensor]) -> List[Tensor]:
 
 def gather_gradients(parameters: List[Tensor]) -> List[Tensor]:
     pgrads = []
-    for param in parameters:
-        pgrad = param.grad.clone()
-        if hasattr(param, "sharded_dims_mp"):
+    for p in parameters:
+        pgrad = p.grad.clone()
+        if hasattr(p, "sharded_dims_mp"):
             # gather the grad across all sharded dimensions
-            for d, group in enumerate(param.sharded_dims_mp):
+            for d, group in enumerate(p.sharded_dims_mp):
                 if (group is not None) and (comm.get_size(group) > 1):
                     pgrad = gather_uneven(pgrad, d, group)
         pgrads.append(pgrad)
@@ -65,10 +65,10 @@ def gather_gradients(parameters: List[Tensor]) -> List[Tensor]:
 
 def split_updates(parameters: List[Tensor], updates_global: List[Tensor]) -> List[Tensor]:
     updates = []
-    for param, up in zip(parameters, updates_global):
+    for p, up in zip(parameters, updates_global):
         update = up.clone()
-        if hasattr(param, "sharded_dims_mp"):
-            for d, group in enumerate(param.sharded_dims_mp):
+        if hasattr(p, "sharded_dims_mp"):
+            for d, group in enumerate(p.sharded_dims_mp):
                 if (group is not None) and (comm.get_size(group) > 1):
                     update = split_tensor_along_dim(update, dim=d, num_chunks=comm.get_size(group))[comm.get_rank(group)]
         updates.append(update)
@@ -77,11 +77,11 @@ def split_updates(parameters: List[Tensor], updates_global: List[Tensor]) -> Lis
 
 def gather_shapes(parameters: List[Tensor]) -> List[Tuple[int]]:
     shapes = []
-    for param in parameters:
-        shape = list(param.shape)
-        if hasattr(param, "sharded_dims_mp"):
+    for p in parameters:
+        shape = list(p.shape)
+        if hasattr(p, "sharded_dims_mp"):
             # compute reduced shape
-            for d, group in enumerate(param.sharded_dims_mp):
+            for d, group in enumerate(p.sharded_dims_mp):
                 if (group is not None) and (comm.get_size(group) > 1):
                     dtens = torch.tensor([shape[d]], dtype=torch.long, device=param.device)
                     dist.all_reduce(dtens, group=comm.get_group(group))
