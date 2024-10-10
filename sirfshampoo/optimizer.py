@@ -533,7 +533,7 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
         # gather the param grads
         if comm.get_size("model") > 1:
             pgrads = gather_gradients(params)
-	else:
+        else:
             pgrads = [p.grad for p in params]
 
         # update preconditioner
