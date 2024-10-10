@@ -41,7 +41,7 @@ def get_batch_size(inputs: Tuple[Tensor, ...]) -> int:
 def gather_params(parameters: List[Tensor]) -> List[Tensor]:
     params = []
     for param in parameters:
-        params = param.clone()
+        param = param.clone()
         if hasattr(param, "sharded_dims_mp"):
             for d, group in enumerate(param.sharded_dims_mp):
                 if (group is not None) and (comm.get_size(group) > 1):
