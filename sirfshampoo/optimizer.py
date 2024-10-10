@@ -15,6 +15,12 @@ from singd.structures.triutoeplitz import TriuToeplitzMatrix
 from torch import Tensor, dtype, zeros_like
 from torch.nn import Module, Parameter
 from torch.optim import Optimizer
+import torch.distributed as dist
+
+# makani stuff
+from modulus.distributed.utils import compute_split_shapes, split_tensor_along_dim
+from makani.utils import comm
+from makani.mpu.helpers import gather_uneven
 
 from sirfshampoo.combiner import PerParameter, PreconditionerGroup
 from sirfshampoo.utils import tensormatdot
@@ -30,6 +36,58 @@ def get_batch_size(inputs: Tuple[Tensor, ...]) -> int:
         The batch size.
     """
     return inputs[0].shape[0]
+
+
+def gather_params(parameters: List[Tensor]) -> List[Tensor]:
+    params = []
+    for param in parameters:
+        params = param.clone()
+        if hasattr(param, "sharded_dims_mp"):
+            for d, group in enumerate(param.sharded_dims_mp):
+                if (group is not None) and (comm.get_size(group) > 1):
+                    param = gather_uneven(param, d, group)
+        params.append(param)
+    return params
+
+
+def gather_gradients(parameters: List[Tensor]) -> List[Tensor]:
+    pgrads = []
+    for param in parameters:
+        pgrad = param.grad.clone()
+        if hasattr(param, "sharded_dims_mp"):
+            # gather the grad across all sharded dimensions
+            for d, group in enumerate(param.sharded_dims_mp):
+                if (group is not None) and (comm.get_size(group) > 1):
+                    pgrad = gather_uneven(pgrad, d, group)
+        pgrads.append(pgrad)
+    return pgrads
+
+
+def split_updates(parameters: List[Tensor], updates_global: List[Tensor]) -> List[Tensor]:
+    updates = []
+    for param, up in zip(parameters, updates_global):
+        update = up.clone()
+        if hasattr(param, "sharded_dims_mp"):
+            for d, group in enumerate(param.sharded_dims_mp):
+                if (group is not None) and (comm.get_size(group) > 1):
+                    update = split_tensor_along_dim(update, dim=d, num_chunks=comm.get_size(group))[comm.get_rank(group)]
+        updates.append(update)
+    return updates
+
+
+def gather_shapes(parameters: List[Tensor]) -> List[Tuple[int]]]:
+    shapes = []
+    for param in parameters:
+        shape = list(param.shape)
+        if hasattr(param, "sharded_dims_mp"):
+            # compute reduced shape
+            for d, group in enumerate(param.sharded_dims_mp):
+                if (group is not None) and (comm.get_size(group) > 1):
+                    dtens = torch.tensor([shape[d]], dtype=torch.long, device=param.device)
+                    dist.all_reduce(dtens, group=comm.get_group(group))
+                    shape[d] = dtens.item()
+        shapes.append(tuple(shape))
+    return shapes
 
 
 # Default strategy for forming parameter combinations that are treated jointly with one
@@ -269,7 +327,7 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
         combiners = []
 
         # figure out which parameters to treat jointly with one pre-conditioner
-        for i, group in enumerate(self.param_groups):
+        for i, group in enumerate(self.param_groups):            
             for combiner in group["combine_params"]:
                 candidates = combiner.identify(model)
                 for candidate in candidates:
@@ -416,12 +474,18 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
             ]
 
             params = group["params"]
+            group["global_shapes"] = gather_shapes(params)
             (dev,) = {p.device for p in params}
             dtypes = group["preconditioner_dtypes"]
             kwargs = [{"dtype": dt, "device": dev} for dt in dtypes]
 
             combiner = group["combine_params"]
-            dims = combiner.group(params).shape
+
+            # gather for dim checking
+            params_global = gather_params(params)
+
+            # compute dims based on global stats
+            dims = combiner.group(params_global).shape
 
             if not len(dtypes) == len(classes) == len(dims):
                 raise RuntimeError(
@@ -458,16 +522,28 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
         Args:
             group_idx: The index of the group in `self.param_groups`.
         """
-        self._update_preconditioner(group_idx)
-        # TODO We could incorporate a scaling trick here, and then return
-        # the scaling and incorporate it into the final update step
-        updates = self._precondition_gradient(group_idx)
 
+        # extract parameters
         group = self.param_groups[group_idx]
         params = group["params"]
         lr = group["lr"]
         alpha1 = group["alpha1"]
         kappa = group["kappa"]
+        
+        # gather the param grads
+        if comm.get_size("model") > 1:
+            pgrads = gather_gradients(params)
+	else:
+            pgrads = [p.grad for p in params]
+
+        # update preconditioner
+        self._update_preconditioner(group_idx, pgrads)
+        # TODO We could incorporate a scaling trick here, and then return
+        # the scaling and incorporate it into the final update step
+        updates_global = self._precondition_gradient(group_idx, pgrads)
+
+        # split tensors
+        updates = split_updates(params, updates_global)
 
         for p, p_step in zip(params, updates):
             # add weight decay
@@ -481,7 +557,7 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
 
             p.data.add_(p_step, alpha=-lr)
 
-    def _update_preconditioner(self, group_idx: int) -> None:
+    def _update_preconditioner(self, group_idx: int, pgrads: List[Tensor]) -> None:
         """Update the preconditioner of a group.
 
         Args:
@@ -501,9 +577,10 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
         beta2 = group["beta2"]
         lam = group["lam"]
         combiner = group["combine_params"]
-
+        
         # arrange the gradients into the tensor that is pre-conditioned
-        G = combiner.group([p.grad for p in group["params"]])
+        #G = combiner.group([p.grad for p in group["params"]])
+        G = combiner.group(pgrads)
         dims = G.shape
         dtypes = group["preconditioner_dtypes"]
 
@@ -557,7 +634,8 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
             # update K_n (first-order truncation of matrix exponential)
             K.add_(K @ m_K, alpha=-beta2 / m_K.frobenius_norm().clamp(min=1.0))
 
-    def _precondition_gradient(self, group_idx: int) -> List[Tensor]:
+            
+    def _precondition_gradient(self, group_idx: int, pgrads: List[Tensor]) -> List[Tensor]:
         """Multiply the pre-conditioner onto the gradient for a parameter group.
 
         Args:
@@ -569,8 +647,10 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
         """
         group = self.param_groups[group_idx]
         params = group["params"]
+        shapes = group["global_shapes"]
         combiner = group["combine_params"]
-        G = combiner.group([p.grad for p in params])
+        G = combiner.group(pgrads)
+        #G = combiner.group([p.grad for p in params])
         dtypes = group["preconditioner_dtypes"]
         Ks = self.preconditioner[group_idx]
         (N,) = {len(Ks), len(dtypes), G.ndim}
@@ -591,7 +671,7 @@ https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.load_state_dict.
         # correct the scaling
         G.mul_((scales**2).prod())
 
-        return combiner.ungroup(G, [p.shape for p in params])
+        return combiner.ungroup(G, shapes)
 
     def _standardize_structures(self):
         """Standardize the values for structures in parameter groups.
