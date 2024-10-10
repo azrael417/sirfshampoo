@@ -75,7 +75,7 @@ def split_updates(parameters: List[Tensor], updates_global: List[Tensor]) -> Lis
     return updates
 
 
-def gather_shapes(parameters: List[Tensor]) -> List[Tuple[int]]]:
+def gather_shapes(parameters: List[Tensor]) -> List[Tuple[int]]:
     shapes = []
     for param in parameters:
         shape = list(param.shape)
