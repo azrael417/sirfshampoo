@@ -84,7 +84,7 @@ def gather_shapes(parameters: List[Tensor]) -> List[Tuple[int]]:
             # compute reduced shape
             for d, group in enumerate(p.sharded_dims_mp):
                 if (group is not None) and (comm.get_size(group) > 1):
-                    dtens = torch.tensor([shape[d]], dtype=torch.long, device=param.device)
+                    dtens = torch.tensor([shape[d]], dtype=torch.long, device=p.device)
                     dist.all_reduce(dtens, group=comm.get_group(group))
                     shape[d] = dtens.item()
         shapes.append(tuple(shape))
