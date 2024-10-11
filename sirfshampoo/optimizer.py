@@ -12,7 +12,8 @@ from singd.structures.diagonal import DiagonalMatrix
 from singd.structures.hierarchical import Hierarchical15_15Matrix
 from singd.structures.triltoeplitz import TrilToeplitzMatrix
 from singd.structures.triutoeplitz import TriuToeplitzMatrix
-from torch import Tensor, dtype, zeros_like, tensor
+import torch
+from torch import Tensor, dtype, zeros_like
 from torch.nn import Module, Parameter
 from torch.optim import Optimizer
 import torch.distributed as dist
@@ -83,7 +84,7 @@ def gather_shapes(parameters: List[Tensor]) -> List[Tuple[int]]:
             # compute reduced shape
             for d, group in enumerate(p.sharded_dims_mp):
                 if (group is not None) and (comm.get_size(group) > 1):
-                    dtens = tensor([shape[d]], dtype=torch.long, device=param.device)
+                    dtens = torch.tensor([shape[d]], dtype=torch.long, device=param.device)
                     dist.all_reduce(dtens, group=comm.get_group(group))
                     shape[d] = dtens.item()
         shapes.append(tuple(shape))
